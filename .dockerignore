@@ -1,0 +1,6 @@
+.git
+.local
+.env
+auth.json
+*.secret.*
+chatgpt-oauth

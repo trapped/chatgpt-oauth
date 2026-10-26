@@ -1,0 +1,14 @@
+/chatgpt-oauth
+/.local/
+*.test
+coverage.out
+.env
+auth.json
+*.secret.*
+__pycache__/
+*.pyc
+
+# Private operational material must never enter this repository.
+/rehearsal/
+/docs/rehearsal*
+/cmd/mock-upstream/
