@@ -69,7 +69,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body map[string]any
-	if json.Unmarshal(data, &body) != nil || body == nil {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	// Preserve numeric schema values exactly, as native Codex does with raw tools.
+	decoder.UseNumber()
+	if decoder.Decode(&body) != nil || body == nil || decoder.Decode(new(any)) != io.EOF {
 		writeError(w, 400, "invalid_request_error", "Expected a JSON object")
 		return
 	}
