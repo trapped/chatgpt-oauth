@@ -14,6 +14,16 @@ import (
 	"sync"
 )
 
+// DefaultMaxBodyBytes matches Bifrost's bounded 100 MiB default, rather than
+// imposing a smaller limit on native image data URLs and full-history requests.
+// https://github.com/maximhq/bifrost/blob/a05ea20e68bf116a35e9f05b1a3d749624b3935e/transports/bifrost-http/lib/config.go#L846
+const DefaultMaxBodyBytes int64 = 100 << 20
+
+// Large or unknown-length bodies have bounded admission independently of the
+// byte limit: JSON normalization can hold several representations in memory.
+// This is an application memory policy, not an upstream protocol requirement.
+const largeBodyThreshold int64 = 8 << 20
+
 type Server struct {
 	Auth           *Auth
 	BaseURL        string
@@ -23,6 +33,8 @@ type Server struct {
 	MaxBody        int64
 	clientOnce     sync.Once
 	upstreamClient *http.Client
+	largeBodyOnce  sync.Once
+	largeBodies    chan struct{}
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -61,11 +73,30 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	limit := s.MaxBody
 	if limit == 0 {
-		limit = 8 << 20
+		limit = DefaultMaxBodyBytes
+	}
+	if limit < 0 {
+		writeError(w, 500, "server_error", "Invalid request body limit")
+		return
+	}
+	if r.ContentLength < 0 || r.ContentLength > largeBodyThreshold {
+		s.largeBodyOnce.Do(func() { s.largeBodies = make(chan struct{}, 1) })
+		select {
+		case s.largeBodies <- struct{}{}:
+			defer func() { <-s.largeBodies }()
+		case <-r.Context().Done():
+			writeError(w, 408, "invalid_request_error", "Request canceled while waiting for body capacity")
+			return
+		}
 	}
 	data, err := io.ReadAll(http.MaxBytesReader(w, r.Body, limit))
 	if err != nil {
-		writeError(w, 413, "invalid_request_error", "Request body too large")
+		var oversized *http.MaxBytesError
+		if errors.As(err, &oversized) {
+			writeError(w, 413, "invalid_request_error", fmt.Sprintf("Request body exceeds the configured limit of %d bytes", limit))
+		} else {
+			writeError(w, 400, "invalid_request_error", "Cannot read request body")
+		}
 		return
 	}
 	var body map[string]any

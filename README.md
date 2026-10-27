@@ -17,6 +17,21 @@ loopback port 10531 by default. Configure the explicit model allowlist with
 `--models`. A non-loopback listener requires `BACKEND_TOKEN_FILE`, pointing to a
 readable mounted backend credential file. Do not publish this service directly.
 
+Request bodies are limited to **100 MiB (104,857,600 bytes)** by default. This is
+a local bounded limit matching Bifrost's default, not an upstream acceptance
+guarantee. Full conversation histories can include base64 image data URLs, so
+an encoded request can be much larger than its text alone. Configure a positive
+decimal byte count with `--max-body-bytes` or `CHATGPT_OAUTH_MAX_BODY_BYTES`;
+the command-line flag takes precedence. Zero, negative and invalid values fail
+startup. Keep intermediary limits and container memory budgets consistent with
+the chosen request size; the adapter reads and normalizes the bounded JSON body
+in memory. Requests over the configured limit return HTTP 413, while body-read
+failures return HTTP 400. One request larger than 8 MiB or with an unknown body
+length is admitted at a time, including its upstream response stream, to bound
+normalization memory. Known smaller requests do not wait for that slot. A queued
+request exits when its context is canceled. This admission policy is local to
+the adapter and does not describe an upstream concurrency requirement.
+
 ## API
 
 - `POST /v1/responses`: JSON and SSE.
