@@ -10,8 +10,17 @@ import (
 )
 
 func chatRequest(b map[string]any) (map[string]any, error) {
-	if n, ok := b["n"].(float64); ok && n != 1 {
-		return nil, errors.New("only n=1 is supported")
+	if value := b["n"]; value != nil {
+		n := float64(0)
+		switch v := value.(type) {
+		case json.Number:
+			n, _ = v.Float64()
+		case float64:
+			n = v
+		}
+		if n != 1 {
+			return nil, errors.New("only n=1 is supported")
+		}
 	}
 	if b["stop"] != nil {
 		return nil, errors.New("stop sequences are unsupported")
@@ -64,7 +73,7 @@ func chatRequest(b map[string]any) (map[string]any, error) {
 		}
 	}
 	result := map[string]any{"model": b["model"], "input": input, "instructions": ""}
-	for _, k := range []string{"parallel_tool_calls", "service_tier", "include", "metadata"} {
+	for _, k := range []string{"parallel_tool_calls", "service_tier", "include", "metadata", "prompt_cache_key", "prompt_cache_options", "prompt_cache_retention"} {
 		if v := b[k]; v != nil {
 			result[k] = v
 		}

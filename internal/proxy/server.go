@@ -11,16 +11,18 @@ import (
 	"math"
 	"net/http"
 	"strings"
-	"time"
+	"sync"
 )
 
 type Server struct {
-	Auth    *Auth
-	BaseURL string
-	Models  []string
-	Token   string
-	Client  *http.Client
-	MaxBody int64
+	Auth           *Auth
+	BaseURL        string
+	Models         []string
+	Token          string
+	Client         *http.Client
+	MaxBody        int64
+	clientOnce     sync.Once
+	upstreamClient *http.Client
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -67,7 +69,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body map[string]any
-	if json.Unmarshal(data, &body) != nil || body == nil {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	// Preserve numeric schema values exactly, as native Codex does with raw tools.
+	decoder.UseNumber()
+	if decoder.Decode(&body) != nil || body == nil || decoder.Decode(new(any)) != io.EOF {
 		writeError(w, 400, "invalid_request_error", "Expected a JSON object")
 		return
 	}
@@ -106,27 +111,14 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, "server_error", "Invalid upstream URL")
 		return
 	}
-	upstream.Header.Set("Authorization", "Bearer "+c.AccessToken)
-	upstream.Header.Set("ChatGPT-Account-ID", c.AccountID)
-	upstream.Header.Set("Content-Type", "application/json")
-	upstream.Header.Set("Accept", "text/event-stream")
-	upstream.Header.Set("Originator", "codex_cli_rs")
-	upstream.Header.Set("User-Agent", "chatgpt-oauth/0.1")
-	client := s.Client
-	if client == nil {
-		client = &http.Client{Timeout: 10 * time.Minute, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-	}
-	resp, err := client.Do(upstream)
+	setUpstreamHeaders(upstream.Header, r.Header, body, c)
+	resp, err := s.httpClient().Do(upstream)
 	if err != nil {
 		writeError(w, 502, "upstream_error", "Upstream request failed")
 		return
 	}
 	defer resp.Body.Close()
-	for _, name := range []string{"Retry-After", "X-Request-ID", "X-Codex-Primary-Used-Percent", "X-Codex-Primary-Reset-After-Seconds", "X-Codex-Secondary-Used-Percent", "X-Codex-Secondary-Reset-After-Seconds"} {
-		if v := resp.Header.Get(name); v != "" {
-			w.Header().Set(name, v)
-		}
-	}
+	copyUpstreamHeaders(w.Header(), resp.Header)
 	if resp.StatusCode != 200 {
 		// Never reflect upstream bodies, which may contain credentials or request text.
 		status := resp.StatusCode
@@ -352,8 +344,19 @@ func normalize(b map[string]any) error {
 		include = append(include, "reasoning.encrypted_content")
 	}
 	b["include"] = include
-	for _, key := range []string{"max_output_tokens", "max_tokens", "temperature", "top_p", "presence_penalty", "frequency_penalty", "logprobs", "top_logprobs", "user", "stream_options"} {
+	// Native Responses stream_options includes reasoning_summary_delivery.
+	// Chat Completions include_usage is consumed by chatRequest instead.
+	// https://github.com/openai/codex/blob/6aaac694803004a63c6f393d153c96d22521a6b9/codex-rs/codex-api/src/common.rs#L173-L181
+	for _, key := range []string{"max_output_tokens", "max_tokens", "temperature", "top_p", "presence_penalty", "frequency_penalty", "logprobs", "top_logprobs", "user"} {
 		delete(b, key)
 	}
 	return nil
+}
+
+func (s *Server) httpClient() *http.Client {
+	if s.Client != nil {
+		return s.Client
+	}
+	s.clientOnce.Do(func() { s.upstreamClient = newUpstreamClient() })
+	return s.upstreamClient
 }
