@@ -351,3 +351,57 @@ func TestInvalidUsageIsRejected(t *testing.T) {
 		t.Fatal("valid accounting rejected")
 	}
 }
+
+// Exercise the actual adapter boundary: a gateway has omitted status from native
+// search history, and the upstream validates it before completing a follow-up.
+func TestNativeSearchHistoryRestoresMissingStatus(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream=%v", stream), func(t *testing.T) {
+			calls := 0
+			up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls++
+				var b map[string]any
+				if err := json.NewDecoder(r.Body).Decode(&b); err != nil {
+					t.Fatal(err)
+				}
+				input := b["input"].([]any)
+				for i, action := range []string{"search", "open_page", "find_in_page"} {
+					item := input[i].(map[string]any)
+					if item["status"] != "completed" || item["action"].(map[string]any)["type"] != action {
+						writeError(w, 400, "invalid_request_error", "Missing required parameter: status")
+						t.Error("native search history not normalized")
+						return
+					}
+					if item["id"] != nil {
+						t.Error("invented native search ID")
+					}
+				}
+				if input[2].(map[string]any)["action"].(map[string]any)["pattern"] != "cache" {
+					t.Error("lost search action fields")
+				}
+				if input[3].(map[string]any)["status"] != "in_progress" {
+					t.Error("explicit status changed")
+				}
+				if input[4].(map[string]any)["status"] != nil {
+					t.Error("added status to another item type")
+				}
+				w.Header().Set("Content-Type", "text/event-stream")
+				sse(w, terminal())
+			}))
+			defer up.Close()
+			server := &Server{Auth: testAuth(t), BaseURL: up.URL, Models: []string{"test-model"}}
+			body := fmt.Sprintf(`{"model":"test-model","stream":%v,"input":[
+    {"type":"web_search_call","action":{"type":"search","query":"cache"}},
+    {"type":"web_search_call","action":{"type":"open_page","url":"https://example.com"}},
+    {"type":"web_search_call","action":{"type":"find_in_page","url":"https://example.com","pattern":"cache"}},
+    {"type":"web_search_call","status":"in_progress","action":{"type":"search","query":"cache"}},
+    {"type":"message","role":"user","content":[{"type":"input_text","text":"Continue"}]}
+   ]}`, stream)
+			w := httptest.NewRecorder()
+			server.ServeHTTP(w, httptest.NewRequest("POST", "/v1/responses", strings.NewReader(body)))
+			if calls != 1 || w.Code != 200 || !strings.Contains(w.Body.String(), `"completed"`) {
+				t.Fatalf("follow-up failed: %d %s", w.Code, w.Body.String())
+			}
+		})
+	}
+}

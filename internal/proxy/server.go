@@ -314,8 +314,19 @@ func normalize(b map[string]any) error {
 	}
 	if input, ok := b["input"].([]any); ok {
 		for _, item := range input {
-			if m, ok := item.(map[string]any); ok && m["type"] == "item_reference" {
+			m, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			if m["type"] == "item_reference" {
 				return errors.New("item_reference is unsupported; send full conversation history")
+			}
+			// Some OpenAI-compatible gateways strip status from replayed native
+			// search calls. The subscription Responses endpoint requires it, even
+			// though id is optional. These are prior calls in stateless history;
+			// preserve explicit statuses and all remaining fields verbatim.
+			if m["type"] == "web_search_call" && m["status"] == nil {
+				m["status"] = "completed"
 			}
 		}
 	}
