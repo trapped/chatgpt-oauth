@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -36,6 +37,7 @@ func run() error {
 	models := flags.String("models", "", "Comma-separated allowed models (required)")
 	source := flags.String("from", "", "Source credential file for import-auth")
 	upstream := flags.String("upstream-url", "https://chatgpt.com/backend-api/codex", "Trusted upstream base URL; override only for local tests")
+	maxBody := flags.String("max-body-bytes", os.Getenv("CHATGPT_OAUTH_MAX_BODY_BYTES"), "Maximum request bytes; positive decimal (default 104857600; env CHATGPT_OAUTH_MAX_BODY_BYTES)")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -53,6 +55,14 @@ func run() error {
 	}
 	if !contains([]string{"serve", "login", "import-auth"}, command) {
 		return errors.New("usage: chatgpt-oauth [serve|login|import-auth|healthcheck]")
+	}
+	bodyLimit := proxy.DefaultMaxBodyBytes
+	if command == "serve" {
+		var err error
+		bodyLimit, err = parseBodyLimit(*maxBody)
+		if err != nil {
+			return err
+		}
 	}
 	if err := os.MkdirAll(filepath.Dir(*authFile), 0700); err != nil {
 		return errors.New("cannot create state directory")
@@ -107,7 +117,7 @@ func run() error {
 	if len(allowed) == 0 {
 		return errors.New("at least one model is required")
 	}
-	handler := &proxy.Server{Auth: auth, Models: allowed, Token: token, BaseURL: *upstream}
+	handler := &proxy.Server{Auth: auth, Models: allowed, Token: token, BaseURL: *upstream, MaxBody: bodyLimit}
 	server := &http.Server{Addr: *listen, Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 32 << 10}
 	go func() {
 		<-ctx.Done()
@@ -122,6 +132,18 @@ func run() error {
 	}
 	return err
 }
+
+func parseBodyLimit(value string) (int64, error) {
+	if value == "" {
+		return proxy.DefaultMaxBodyBytes, nil
+	}
+	limit, err := strconv.ParseInt(value, 10, 64)
+	if err != nil || limit <= 0 {
+		return 0, errors.New("--max-body-bytes / CHATGPT_OAUTH_MAX_BODY_BYTES must be a positive decimal byte count")
+	}
+	return limit, nil
+}
+
 func contains(values []string, v string) bool {
 	for _, s := range values {
 		if s == v {
