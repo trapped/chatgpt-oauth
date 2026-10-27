@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 )
 
 // DefaultMaxBodyBytes matches Bifrost's bounded 100 MiB default, rather than
@@ -23,6 +24,8 @@ const DefaultMaxBodyBytes int64 = 100 << 20
 // byte limit: JSON normalization can hold several representations in memory.
 // This is an application memory policy, not an upstream protocol requirement.
 const largeBodyThreshold int64 = 8 << 20
+
+const requestBodyReadTimeout = 30 * time.Second
 
 type Server struct {
 	Auth           *Auth
@@ -79,7 +82,24 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, "server_error", "Invalid request body limit")
 		return
 	}
+	if r.ContentLength > limit {
+		writeError(w, 413, "invalid_request_error", fmt.Sprintf("Request body exceeds the configured limit of %d bytes", limit))
+		return
+	}
+	controller := http.NewResponseController(w)
+	setReadDeadline := func(deadline time.Time) bool {
+		if err := controller.SetReadDeadline(deadline); err != nil && !errors.Is(err, http.ErrNotSupported) {
+			writeError(w, 400, "invalid_request_error", "Cannot set request body deadline")
+			return false
+		}
+		return true
+	}
 	if r.ContentLength < 0 || r.ContentLength > largeBodyThreshold {
+		// ReadTimeout starts before admission. Clear it while queued: an expired
+		// deadline cannot reliably be extended by ResponseController afterward.
+		if !setReadDeadline(time.Time{}) {
+			return
+		}
 		s.largeBodyOnce.Do(func() { s.largeBodies = make(chan struct{}, 1) })
 		select {
 		case s.largeBodies <- struct{}{}:
@@ -89,7 +109,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// The body gets the full read window after admission, independently of any
+	// preceding response stream. Clear it after reading, before our own SSE.
+	if !setReadDeadline(time.Now().Add(requestBodyReadTimeout)) {
+		return
+	}
 	data, err := io.ReadAll(http.MaxBytesReader(w, r.Body, limit))
+	_ = controller.SetReadDeadline(time.Time{})
 	if err != nil {
 		var oversized *http.MaxBytesError
 		if errors.As(err, &oversized) {
@@ -132,7 +158,17 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 503, "authentication_error", err.Error())
 		return
 	}
-	data, _ = json.Marshal(body)
+	var payload bytes.Buffer
+	encoder := json.NewEncoder(&payload)
+	// This is a JSON protocol body, not JSON embedded in HTML. Avoid expanding
+	// each <, > or & into a six-byte escape in large text/history requests.
+	// https://pkg.go.dev/encoding/json#Encoder.SetEscapeHTML
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(body); err != nil {
+		writeError(w, 500, "server_error", "Cannot encode upstream request")
+		return
+	}
+	data = bytes.TrimSuffix(payload.Bytes(), []byte("\n"))
 	base := s.BaseURL
 	if base == "" {
 		base = "https://chatgpt.com/backend-api/codex"

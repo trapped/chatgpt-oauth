@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -205,5 +206,164 @@ func TestLargeBodyAdmissionAllowsSmallRequestsAndCancellation(t *testing.T) {
 	}
 	if canceledResult.Code != http.StatusRequestTimeout {
 		t.Fatalf("canceled queued request status = %d", canceledResult.Code)
+	}
+}
+
+type bodyDeadlineRecorder struct {
+	*httptest.ResponseRecorder
+	deadline func(time.Time) error
+}
+
+func (r *bodyDeadlineRecorder) SetReadDeadline(deadline time.Time) error {
+	return r.deadline(deadline)
+}
+
+type observingRequestBody struct {
+	io.Reader
+	read func()
+}
+
+func (b observingRequestBody) Read(p []byte) (int, error) {
+	b.read()
+	return b.Reader.Read(p)
+}
+func (observingRequestBody) Close() error { return nil }
+
+func TestLargeBodyReadDeadlineStartsAfterAdmission(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { sse(w, terminal()) }))
+	defer upstream.Close()
+	server := &Server{Auth: testAuth(t), BaseURL: upstream.URL, Models: []string{"test-model"}}
+	server.largeBodyOnce.Do(func() {
+		server.largeBodies = make(chan struct{}, 1)
+		server.largeBodies <- struct{}{}
+	})
+	var mutex sync.Mutex
+	var events []string
+	var activeDeadline time.Time
+	queued := make(chan struct{}, 1)
+	result := &bodyDeadlineRecorder{
+		ResponseRecorder: httptest.NewRecorder(),
+		deadline: func(deadline time.Time) error {
+			mutex.Lock()
+			defer mutex.Unlock()
+			activeDeadline = deadline
+			if deadline.IsZero() {
+				events = append(events, "clear")
+				select {
+				case queued <- struct{}{}:
+				default:
+				}
+			} else {
+				events = append(events, "start")
+				if remaining := time.Until(deadline); remaining < 25*time.Second || remaining > 31*time.Second {
+					t.Errorf("body did not receive a fresh 30-second read window: %v", remaining)
+				}
+			}
+			return nil
+		},
+	}
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	request.ContentLength = -1
+	request.Body = observingRequestBody{
+		Reader: strings.NewReader(`{"model":"test-model","input":"queued"}`),
+		read: func() {
+			mutex.Lock()
+			defer mutex.Unlock()
+			events = append(events, "read")
+			if activeDeadline.IsZero() {
+				t.Error("body read before its deadline was installed")
+			}
+		},
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		server.ServeHTTP(result, request)
+	}()
+	select {
+	case <-queued:
+	case <-time.After(5 * time.Second):
+		t.Fatal("queued request did not clear its initial read deadline")
+	}
+	mutex.Lock()
+	if len(events) != 1 || events[0] != "clear" {
+		t.Errorf("deadline started or body read before capacity was available: %v", events)
+	}
+	mutex.Unlock()
+	<-server.largeBodies
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("queued body did not complete after admission")
+	}
+	if result.Code != http.StatusOK {
+		t.Fatalf("queued request failed: %d %s", result.Code, result.Body.String())
+	}
+	if len(events) < 4 || events[0] != "clear" || events[1] != "start" || events[2] != "read" || events[len(events)-1] != "clear" {
+		t.Fatalf("incorrect deadline/body ordering: %v", events)
+	}
+}
+
+func TestDeclaredOversizeRejectedBeforeAdmissionOrRead(t *testing.T) {
+	server := &Server{MaxBody: largeBodyThreshold + 1}
+	// Occupied capacity ensures an oversize declaration is rejected without
+	// waiting; the deadline callback and reader must not be touched either.
+	server.largeBodyOnce.Do(func() {
+		server.largeBodies = make(chan struct{}, 1)
+		server.largeBodies <- struct{}{}
+	})
+	request := httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	request.ContentLength = server.MaxBody + 1
+	request.Body = observingRequestBody{Reader: strings.NewReader(""), read: func() { t.Error("oversize body was read") }}
+	result := &bodyDeadlineRecorder{ResponseRecorder: httptest.NewRecorder(), deadline: func(time.Time) error {
+		t.Error("oversize request entered read-deadline/admission handling")
+		return nil
+	}}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		server.ServeHTTP(result, request)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		<-server.largeBodies
+		t.Fatal("declared oversize request waited for body capacity")
+	}
+	if result.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("declared oversize status = %d", result.Code)
+	}
+}
+
+func TestUpstreamBodyDoesNotExpandHTMLText(t *testing.T) {
+	instructions := strings.Repeat("<>&", 4096)
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		data, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Error(err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		var body map[string]any
+		if err := json.Unmarshal(data, &body); err != nil || body["instructions"] != instructions {
+			t.Errorf("HTML text changed while encoding upstream: %v", err)
+		}
+		if len(data) > len(instructions)+1024 {
+			t.Errorf("HTML text expanded in protocol body: %d bytes for %d text bytes", len(data), len(instructions))
+		}
+		for _, escape := range []string{`\u003c`, `\u003e`, `\u0026`} {
+			if bytes.Contains(data, []byte(escape)) {
+				t.Errorf("HTML-only escape %s appeared in JSON protocol body", escape)
+			}
+		}
+		sse(w, terminal())
+	}))
+	defer upstream.Close()
+	server := &Server{Auth: testAuth(t), BaseURL: upstream.URL, Models: []string{"test-model"}}
+	body := `{"model":"test-model","input":"Continue","instructions":"` + instructions + `"}`
+	result := httptest.NewRecorder()
+	server.ServeHTTP(result, httptest.NewRequest(http.MethodPost, "/v1/responses", strings.NewReader(body)))
+	if result.Code != http.StatusOK {
+		t.Fatalf("HTML request failed: %d %s", result.Code, result.Body.String())
 	}
 }

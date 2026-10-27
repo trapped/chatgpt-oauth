@@ -30,7 +30,11 @@ failures return HTTP 400. One request larger than 8 MiB or with an unknown body
 length is admitted at a time, including its upstream response stream, to bound
 normalization memory. Known smaller requests do not wait for that slot. A queued
 request exits when its context is canceled. This admission policy is local to
-the adapter and does not describe an upstream concurrency requirement.
+the adapter and does not describe an upstream concurrency requirement. The
+30-second body-read window starts after admission, so time spent waiting behind
+an earlier stream does not consume it. A known content length above the limit
+is rejected before admission or reading. Upstream JSON keeps literal `<`, `>`
+and `&` characters, avoiding HTML-only escape expansion of large text histories.
 
 ## API
 
