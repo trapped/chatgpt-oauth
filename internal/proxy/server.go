@@ -15,13 +15,13 @@ import (
 )
 
 type Server struct {
-	Auth    *Auth
-	BaseURL string
-	Models  []string
-	Token   string
-	Client  *http.Client
-	MaxBody int64
-	clientOnce sync.Once
+	Auth           *Auth
+	BaseURL        string
+	Models         []string
+	Token          string
+	Client         *http.Client
+	MaxBody        int64
+	clientOnce     sync.Once
 	upstreamClient *http.Client
 }
 
@@ -108,23 +108,14 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, "server_error", "Invalid upstream URL")
 		return
 	}
-	upstream.Header.Set("Authorization", "Bearer "+c.AccessToken)
-	upstream.Header.Set("ChatGPT-Account-ID", c.AccountID)
-	upstream.Header.Set("Content-Type", "application/json")
-	upstream.Header.Set("Accept", "text/event-stream")
-	upstream.Header.Set("Originator", "codex_cli_rs")
-	upstream.Header.Set("User-Agent", "chatgpt-oauth/0.1")
+	setUpstreamHeaders(upstream.Header, r.Header, body, c)
 	resp, err := s.httpClient().Do(upstream)
 	if err != nil {
 		writeError(w, 502, "upstream_error", "Upstream request failed")
 		return
 	}
 	defer resp.Body.Close()
-	for _, name := range []string{"Retry-After", "X-Request-ID", "X-Codex-Primary-Used-Percent", "X-Codex-Primary-Reset-After-Seconds", "X-Codex-Secondary-Used-Percent", "X-Codex-Secondary-Reset-After-Seconds"} {
-		if v := resp.Header.Get(name); v != "" {
-			w.Header().Set(name, v)
-		}
-	}
+	copyUpstreamHeaders(w.Header(), resp.Header)
 	if resp.StatusCode != 200 {
 		// Never reflect upstream bodies, which may contain credentials or request text.
 		status := resp.StatusCode
