@@ -45,6 +45,11 @@ The gateway must own client authentication, budgets, limits and public access.
 Keep credentials and deployment configuration outside this repository and image.
 The container runs as UID/GID 65532; mounted state must be writable by that user.
 
+Native session affinity, turn state and client metadata are preserved through
+the HTTP path. Infrastructure routing cookies remain private to the upstream
+client. See the [protocol source map](docs/protocol-parity.md) for pinned sources,
+verification and intermediary requirements.
+
 ## Tests
 
 ```sh
